@@ -3,7 +3,7 @@ const express = require('express');
 const crypto = require('crypto');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;  // From Vercel env
-const LEADER_USERNAME = 'your_username';  // Replace with your @handle (no @)
+const LEADER_USERNAME = 'BasedPing_bot';  // Replace with your @handle (no @)
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
 app.use(express.json());
