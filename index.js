@@ -1,23 +1,28 @@
 const { Telegraf } = require('telegraf');
 const express = require('express');
-const crypto = require('crypto');  // For signing
+const crypto = require('crypto');
 
-const BOT_TOKEN = 'YOUR_BOT_TOKEN';  // From BotFather
-const LEADER_USERNAME = 'your_username';  // Your Telegram @handle
+const BOT_TOKEN = process.env.BOT_TOKEN;  // From Vercel env
+const LEADER_USERNAME = 'your_username';  // Replace with your @handle (no @)
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
 app.use(express.json());
 
-let subscribers = [];  // {userId: number, risk: number}
-let pendingSignals = [];  // {id: string, data: object, subscribers: [userId]}
+// Subscribers: {userId: {risk: number, ref: string}}
+let subscribers = {};
 
-bot.launch();
-
-// Subscribe command
+// Subscribe command with ref check
 bot.command('subscribe', (ctx) => {
+  const messageText = ctx.message.text;
+  const refMatch = messageText.match(/ref=([A-Z]+)/);  // e.g., /subscribe?ref=GODSEYE
+  const ref = refMatch ? refMatch[1] : null;
+  if (ref !== 'GODSEYE') {  // Your referral code
+    ctx.reply('Invalid referral. Join via leader link.');
+    return;
+  }
   const userId = ctx.from.id;
-  subscribers[userId] = { userId, risk: 0.5 };  // Default risk
-  ctx.reply('Subscribed! Set risk with /risk 0.5. Auto-copy starts in app.');
+  subscribers[userId] = { userId, risk: 0.5, ref };
+  ctx.reply(`Subscribed with ref ${ref}! Set risk with /risk 0.5.`);
 });
 
 // Unsubscribe
@@ -30,45 +35,66 @@ bot.command('unsubscribe', (ctx) => {
 // Risk set
 bot.command('risk', (ctx) => {
   const userId = ctx.from.id;
-  const risk = parseFloat(ctx.message.text.split(' ')[1]) || 0.5;
-  if (subscribers[userId]) subscribers[userId].risk = Math.min(Math.max(risk, 0.1), 2);
-  ctx.reply(`Risk set to ${subscribers[userId]?.risk || 0.5}x.`);
+  const parts = ctx.message.text.split(' ');
+  const risk = parseFloat(parts[1]) || 0.5;
+  if (subscribers[userId]) {
+    subscribers[userId].risk = Math.min(Math.max(risk, 0.1), 2);
+    ctx.reply(`Risk set to ${subscribers[userId].risk}x.`);
+  } else {
+    ctx.reply('Subscribe first with /subscribe?ref=GODSEYE.');
+  }
 });
 
-// Parse group messages for signals
+// Parse group messages for signals (only from leader)
 bot.on('text', async (ctx) => {
   if (ctx.message.text.includes('New Trade Alert!') && ctx.from.username === LEADER_USERNAME) {
     const jsonMatch = ctx.message.text.match(/<!-- SIGNAL: ({.*}) -->/);
     if (jsonMatch) {
-      const signal = JSON.parse(jsonMatch[1]);
+      let signal;
+      try {
+        signal = JSON.parse(jsonMatch[1]);
+      } catch (e) {
+        return;  // Invalid JSON
+      }
       if (verifySignal(signal)) {  // Check signature
         const signalId = crypto.randomUUID();
-        pendingSignals.push({ id: signalId, data: signal, subscribers: Object.keys(subscribers) });
-        // DM subscribers
-        subscribers.forEach(sub => bot.telegram.sendMessage(sub.userId, `Signal: ${JSON.stringify(signal)}`));
+        // Notify subscribers (DM signal for auto-copy)
+        Object.values(subscribers).forEach(sub => {
+          bot.telegram.sendMessage(sub.userId, `Auto-Signal: ${JSON.stringify(signal)}`);  // App polls this
+        });
+        console.log(`Signal broadcast to ${Object.keys(subscribers).length} subscribers:`, signal);
       }
     }
   }
 });
 
 function verifySignal(signal) {
-  return signal.signature === 'GODSEYE-HASH-ABC123';
+  return signal.signature === 'GODSEYE-HASH-ABC123';  // Match leader's hash
 }
 
-// API endpoint for app polling (Vercel /api/signals)
+// Vercel API endpoint for app polling (follower fetches pending signals)
 app.get('/api/signals', (req, res) => {
   const userId = req.query.userId;
-  const userSignals = pendingSignals.filter(s => s.subscribers.includes(userId)).map(s => s.data);
-  res.json(userSignals);
+  // Simulate pending (in real, store in DB like Redis; here, dummy for test)
+  const dummySignal = subscribers[userId] ? {
+    id: 'test-signal',
+    symbol: 'USTC',
+    side: 'BUY',
+    size: 3022,
+    price: 0.008275,
+    signature: 'GODSEYE-HASH-ABC123'
+  } : null;
+  res.json(dummySignal ? [dummySignal] : []);
 });
 
 app.delete('/api/signals/:id', (req, res) => {
   const id = req.params.id;
-  pendingSignals = pendingSignals.filter(s => s.id !== id);
+  // Dummy delete
   res.json({ success: true });
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Bot API on port ${port}`));
+// Webhook for Telegram (Vercel URL + /webhook)
+app.use(bot.webhookCallback('/webhook'));
 
-module.exports = bot;  // For Vercel
+// Vercel default export (fixes 500)
+module.exports = app;
