@@ -50,19 +50,21 @@ bot.on('text', async (ctx) => {
   if (ctx.message.text.includes('New Trade Alert!') && ctx.from.username === LEADER_USERNAME) {
     const jsonMatch = ctx.message.text.match(/<!-- SIGNAL: ({.*}) -->/);
     if (jsonMatch) {
-      let signal;
       try {
-        signal = JSON.parse(jsonMatch[1]);
+        const signal = JSON.parse(jsonMatch[1]);
+        if (verifySignal(signal)) {
+          const signalId = crypto.randomUUID();
+          // Store real signals per sub (in-memory array for now)
+          Object.values(subscribers).forEach(sub => {
+            if (!sub.signals) sub.signals = [];
+            sub.signals.push({ ...signal, id: signalId });
+            bot.telegram.sendMessage(sub.userId, `Auto-Signal: ${JSON.stringify(signal)}`);  // App polls this
+          });
+          console.log(`Signal broadcast to ${Object.keys(subscribers).length} subscribers:`, signal);
+        }
       } catch (e) {
-        return;  // Invalid JSON
-      }
-      if (verifySignal(signal)) {  // Check signature
-        const signalId = crypto.randomUUID();
-        // Notify subscribers (DM signal for auto-copy)
-        Object.values(subscribers).forEach(sub => {
-          bot.telegram.sendMessage(sub.userId, `Auto-Signal: ${JSON.stringify(signal)}`);  // App polls this
-        });
-        console.log(`Signal broadcast to ${Object.keys(subscribers).length} subscribers:`, signal);
+        console.error('Signal parse error:', e.message);
+        return;  // Invalid JSON, skip
       }
     }
   }
