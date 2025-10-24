@@ -77,16 +77,9 @@ function verifySignal(signal) {
 // Vercel API endpoint for app polling (follower fetches pending signals)
 app.get('/api/signals', (req, res) => {
   const userId = req.query.userId;
-  // Simulate pending (in real, store in DB like Redis; here, dummy for test)
-  const dummySignal = subscribers[userId] ? {
-    id: 'test-signal',
-    symbol: 'USTC',
-    side: 'BUY',
-    size: 3022,
-    price: 0.008275,
-    signature: 'GODSEYE-HASH-ABC123'
-  } : null;
-  res.json(dummySignal ? [dummySignal] : []);
+  const sub = Object.values(subscribers).find(s => s.userId == userId);
+  const pending = sub ? (sub.signals || []) : [];
+  res.json(pending);  // Array of signals for this user
 });
 
 app.delete('/api/signals/:id', (req, res) => {
