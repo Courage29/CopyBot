@@ -48,10 +48,10 @@ bot.command('risk', (ctx) => {
 // Parse group messages for signals (only from leader)
 bot.on('text', async (ctx) => {
   if (ctx.message.text.includes('New Trade Alert!') && ctx.from.username === LEADER_USERNAME) {
-    const jsonMatch = ctx.message.text.match(/<!-- SIGNAL: ({.*}) -->/);
-    if (jsonMatch) {
+    const spoilerMatch = ctx.message.text.match(/<tg-spoiler>SIGNAL: ({.*})<\/tg-spoiler>/);
+    if (spoilerMatch) {
       try {
-        const signal = JSON.parse(jsonMatch[1]);
+        const signal = JSON.parse(spoilerMatch[1]);
         if (verifySignal(signal)) {
           const signalId = crypto.randomUUID();
           // Store real signals per sub (in-memory array for now)
