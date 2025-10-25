@@ -7,6 +7,11 @@ const LEADER_USERNAME = 'BasedPing_bot';  // Replace with your @handle (no @)
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
 app.use(express.json());
+app.use(express.json());
+
+// NEW: CORS fix for local dev (allows localhost to fetch API without browser block)
+const cors = require('cors');
+app.use(cors({ origin: '*' }));  // '*' = allow all origins (localhost + prod)
 
 // Subscribers: {userId: {risk: number, ref: string}}
 let subscribers = {};
