@@ -7,7 +7,6 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@vercel/postgres": "^0.6.0",
     "telegraf": "^4.16.3",
     "express": "^4.19.2",
     "crypto": "builtin",
