@@ -1,100 +1,147 @@
-const { Telegraf } = require('telegraf');
-const express = require('express');
-const crypto = require('crypto');
+// index.js
+import { sql } from "@vercel/postgres";
+import { Telegraf } from "telegraf";
+import express from "express";
+import crypto from "crypto";
+import cors from "cors";
 
-const BOT_TOKEN = process.env.BOT_TOKEN;  // From Vercel env
-const LEADER_USERNAME = 'BasedPing_bot';  // Replace with your @handle (no @)
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const APP_SECRET = process.env.APP_SECRET; // MUST BE SET IN VERCEL
+const LEADER_USERNAME = "BasedPing_bot";
+
+if (!BOT_TOKEN || !APP_SECRET) {
+  throw new Error("BOT_TOKEN and APP_SECRET must be set in Vercel Env");
+}
+
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
 app.use(express.json());
-app.use(express.json());
+app.use(cors({ origin: "*" }));
 
-// NEW: CORS fix for local dev (allows localhost to fetch API without browser block)
-const cors = require('cors');
-app.use(cors({ origin: '*' }));  // '*' = allow all origins (localhost + prod)
+// Rate limiting
+const rateLimits = {};
+function rateLimit(req, res, next) {
+  const userId = req.query.userId || req.body.userId;
+  const now = Date.now();
+  const window = 60_000;
+  if (!rateLimits[userId])
+    rateLimits[userId] = { count: 0, reset: now + window };
+  if (now > rateLimits[userId].reset)
+    rateLimits[userId] = { count: 0, reset: now + window };
+  if (rateLimits[userId].count >= 10)
+    return res.status(429).json({ error: "Rate limit" });
+  rateLimits[userId].count++;
+  next();
+}
 
-// Subscribers: {userId: {risk: number, ref: string}}
-let subscribers = {};
+// === COMMANDS ===
+bot.command("subscribe", async (ctx) => {
+  const ref = ctx.message.text.match(/ref=([A-Z]+)/)?.[1];
+  if (ref !== "GODSEYE") return ctx.reply("Invalid referral.");
+  const userId = ctx.from.id.toString();
+  try {
+    await sql`INSERT INTO subs (user_id, risk, ref) VALUES (${userId}, 0.5, ${ref})
+              ON CONFLICT (user_id) DO UPDATE SET risk = 0.5, ref = ${ref}`;
+    ctx.reply(`Subscribed! Use /risk 0.5 to adjust.`);
+  } catch (e) {
+    ctx.reply("Error.");
+  }
+});
 
-// Subscribe command with ref check
-bot.command('subscribe', (ctx) => {
-  const messageText = ctx.message.text;
-  const refMatch = messageText.match(/ref=([A-Z]+)/);  // e.g., /subscribe?ref=GODSEYE
-  const ref = refMatch ? refMatch[1] : null;
-  if (ref !== 'GODSEYE') {  // Your referral code
-    ctx.reply('Invalid referral. Join via leader link.');
+bot.command("unsubscribe", async (ctx) => {
+  const userId = ctx.from.id.toString();
+  await sql`DELETE FROM signals WHERE user_id = ${userId}`;
+  const { rowCount } = await sql`DELETE FROM subs WHERE user_id = ${userId}`;
+  ctx.reply(rowCount > 0 ? "Unsubscribed." : "Not subscribed.");
+});
+
+bot.command("risk", async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const risk = parseFloat(ctx.message.text.split(" ")[1]);
+  if (isNaN(risk) || risk < 0.1 || risk > 2) return ctx.reply("Risk 0.1–2.0");
+  const { rowCount } =
+    await sql`UPDATE subs SET risk = ${risk} WHERE user_id = ${userId}`;
+  ctx.reply(rowCount > 0 ? `Risk: ${risk}x` : "Subscribe first.");
+});
+
+// === SIGNAL INTAKE ===
+bot.on("text", async (ctx) => {
+  if (
+    !ctx.message.text.includes("New Trade Alert!") ||
+    ctx.from.username !== LEADER_USERNAME
+  )
+    return;
+
+  const match = ctx.message.text.match(
+    /SIGNAL: ({[\s\S]*?})(?:<\/tg-spoiler>|$)/
+  );
+  if (!match) return;
+
+  let signal;
+  try {
+    signal = JSON.parse(match[1]);
+  } catch {
     return;
   }
-  const userId = ctx.from.id;
-  subscribers[userId] = { userId, risk: 0.5, ref };
-  ctx.reply(`Subscribed with ref ${ref}! Set risk with /risk 0.5.`);
-});
 
-// Unsubscribe
-bot.command('unsubscribe', (ctx) => {
-  const userId = ctx.from.id;
-  delete subscribers[userId];
-  ctx.reply('Unsubscribed.');
-});
+  if (!verifySignal(signal)) return console.log("Invalid sig");
 
-// Risk set
-bot.command('risk', (ctx) => {
-  const userId = ctx.from.id;
-  const parts = ctx.message.text.split(' ');
-  const risk = parseFloat(parts[1]) || 0.5;
-  if (subscribers[userId]) {
-    subscribers[userId].risk = Math.min(Math.max(risk, 0.1), 2);
-    ctx.reply(`Risk set to ${subscribers[userId].risk}x.`);
-  } else {
-    ctx.reply('Subscribe first with /subscribe?ref=GODSEYE.');
+  const signalId = crypto.randomUUID();
+  const { rows } = await sql`SELECT user_id FROM subs WHERE ref = 'GODSEYE'`;
+
+  for (const { user_id } of rows) {
+    await sql`INSERT INTO signals (id, user_id, signal) 
+              VALUES (${signalId}, ${user_id}, ${JSON.stringify({
+      ...signal,
+      id: signalId,
+    })}::jsonb)
+              ON CONFLICT (id, user_id) DO NOTHING`;
   }
-});
-
-// Parse group messages for signals (only from leader)
-bot.on('text', async (ctx) => {
-  if (ctx.message.text.includes('New Trade Alert!') && ctx.from.username === LEADER_USERNAME) {
-    const spoilerMatch = ctx.message.text.match(/<tg-spoiler>SIGNAL: ({.*})<\/tg-spoiler>/);
-    if (spoilerMatch) {
-      try {
-        const signal = JSON.parse(spoilerMatch[1]);
-        if (verifySignal(signal)) {
-          const signalId = crypto.randomUUID();
-          // Store real signals per sub (in-memory array for now)
-          Object.values(subscribers).forEach(sub => {
-            if (!sub.signals) sub.signals = [];
-            sub.signals.push({ ...signal, id: signalId });
-            bot.telegram.sendMessage(sub.userId, `Auto-Signal: ${JSON.stringify(signal)}`);  // App polls this
-          });
-          console.log(`Signal broadcast to ${Object.keys(subscribers).length} subscribers:`, signal);
-        }
-      } catch (e) {
-        console.error('Signal parse error:', e.message);
-        return;  // Invalid JSON, skip
-      }
-    }
-  }
+  console.log(`Broadcast to ${rows.length} users`);
 });
 
 function verifySignal(signal) {
-  return signal.signature === 'GODSEYE-HASH-ABC123';  // Match leader's hash
+  const data = JSON.stringify({
+    symbol: signal.symbol,
+    side: signal.side,
+    size: signal.size,
+    price: signal.price,
+    leverage: signal.leverage,
+  });
+  const hash = crypto
+    .createHmac("sha256", APP_SECRET)
+    .update(data)
+    .digest("hex");
+  return hash === signal.signature;
 }
 
-// Vercel API endpoint for app polling (follower fetches pending signals)
-app.get('/api/signals', (req, res) => {
-  const userId = req.query.userId;
-  const sub = Object.values(subscribers).find(s => s.userId == userId);
-  const pending = sub ? (sub.signals || []) : [];
-  res.json(pending);  // Array of signals for this user
+// === API ===
+app.get("/api/signals", rateLimit, async (req, res) => {
+  const { userId } = req.query;
+  const { rows } =
+    await sql`SELECT signal FROM signals WHERE user_id = ${userId} ORDER BY created_at DESC LIMIT 10`;
+  res.json(rows.map((r) => r.signal));
 });
 
-app.delete('/api/signals/:id', (req, res) => {
-  const id = req.params.id;
-  // Dummy delete
-  res.json({ success: true });
+app.delete("/api/signals/:id", rateLimit, async (req, res) => {
+  const { id } = req.params;
+  const { userId } = req.query;
+  const { rowCount } =
+    await sql`DELETE FROM signals WHERE id = ${id} AND user_id = ${userId}`;
+  res.json(rowCount > 0 ? { success: true } : { error: "Not found" });
 });
 
-// Webhook for Telegram (Vercel URL + /webhook)
-app.use(bot.webhookCallback('/webhook'));
+app.get("/api/risk", rateLimit, async (req, res) => {
+  const { rows } =
+    await sql`SELECT risk FROM subs WHERE user_id = ${req.query.userId}`;
+  res.json(rows[0] ? { risk: rows[0].risk } : { error: "Not subbed" });
+});
 
-// Vercel default export (fixes 500)
-module.exports = app;
+app.get("/api/subscription", rateLimit, async (req, res) => {
+  const { rows } =
+    await sql`SELECT risk FROM subs WHERE user_id = ${req.query.userId}`;
+  res.json({ subscribed: rows.length > 0, risk: rows[0]?.risk });
+});
+
+app.use(bot.webhookCallback("/webhook"));
+export default app;
