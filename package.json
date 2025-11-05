@@ -8,6 +8,7 @@
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
     "db:generate": "prisma generate"
+    "start": "node api/index.js"
   },
   "dependencies": {
     "@prisma/client": "^6.18.0",

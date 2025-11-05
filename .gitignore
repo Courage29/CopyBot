@@ -1,5 +1,10 @@
 # Dependencies
+# Dependencies
 node_modules/
+package-lock.json
+yarn.lock
+
+# Environment variables
 package-lock.json
 yarn.lock
 
