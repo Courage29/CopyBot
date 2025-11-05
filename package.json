@@ -4,12 +4,17 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node api/index.js",
+    "db:push": "prisma db push",
+    "db:migrate": "prisma migrate dev",
+    "db:generate": "prisma generate"
   },
   "dependencies": {
+    "@prisma/client": "^6.18.0",
     "@vercel/postgres": "^0.10.0",
-    "telegraf": "^4.16.3",
+    "cors": "^2.8.5",
     "express": "^4.19.2",
-    "cors": "^2.8.5"
+    "prisma": "^6.18.0",
+    "telegraf": "^4.16.3"
   }
 }
