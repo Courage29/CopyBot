@@ -5,7 +5,10 @@
   "main": "index.js",
   "scripts": {
     "start": "node api/index.js",
+    "dev": "node api/index.js",
+    "prisma:generate": "prisma generate",
     "db:push": "prisma db push",
+    "postinstall": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:generate": "prisma generate"
   },

@@ -46,6 +46,7 @@ const config: runtime.GetPrismaClientConfig = {
     "db"
   ],
   "activeProvider": "postgresql",
+  "postinstall": false,
   "inlineDatasources": {
     "db": {
       "url": {
@@ -56,7 +57,7 @@ const config: runtime.GetPrismaClientConfig = {
   },
   "inlineSchema": "// This is your Prisma schema file,\n// learn more about it in the docs: https://pris.ly/d/prisma-schema\n\n// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?\n// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init\n\ngenerator client {\n  provider = \"prisma-client\"\n  output   = \"../generated/prisma\"\n}\n\ndatasource db {\n  provider = \"postgresql\"\n  url      = env(\"DATABASE_URL\")\n}\n\n// Models (your tables as type-safe schemas)\nmodel leaders {\n  id            String   @id @default(uuid())\n  user_id       String   @unique // Telegram user ID\n  bot_token     String\n  chat_id       String\n  referral_code String   @unique // Auto-generated\n  created_at    DateTime @default(now())\n\n  // Relations\n  followers followers[]\n  signals   signals[]\n\n  @@map(\"leaders\") // Maps to \"leaders\" table\n}\n\nmodel followers {\n  id               String @id @default(uuid())\n  leader_user_id   String\n  follower_user_id String\n  risk             Float  @default(0.5)\n\n  // Relations\n  leader leaders @relation(fields: [leader_user_id], references: [user_id], onDelete: Cascade)\n\n  @@unique([leader_user_id, follower_user_id]) // One follower per leader\n  @@map(\"followers\")\n}\n\nmodel signals {\n  id             String   @id @default(uuid())\n  leader_user_id String\n  signal         Json // JSONB for trade data\n  created_at     DateTime @default(now())\n\n  // Relations\n  leader leaders @relation(fields: [leader_user_id], references: [user_id])\n\n  @@map(\"signals\")\n}\n",
   "inlineSchemaHash": "713d48c35ecc65ac42b1984a280e44045ffcfb935728d90a745c30a715dd5702",
-  "copyEngine": false,
+  "copyEngine": true,
   "runtimeDataModel": {
     "models": {},
     "enums": {},
