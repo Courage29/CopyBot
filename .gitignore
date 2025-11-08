@@ -41,4 +41,3 @@ coverage/
 # Build
 dist/
 build/
-/generated/prisma

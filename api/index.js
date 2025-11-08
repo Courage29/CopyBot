@@ -1,56 +1,454 @@
-// api/index.js
-import { sql } from "@vercel/postgres";
-import { Telegraf } from "telegraf";
+// index.js
+import { PrismaClient } from "@prisma/client";
 import express from "express";
-import crypto from "crypto";
 import cors from "cors";
+import crypto from "crypto";
+import * as dotenv from "dotenv";
+import rateLimit from "express-rate-limit";
+import { WebSocketServer } from "ws";
+import http from "http";
 
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const APP_SECRET = process.env.APP_SECRET;
-const LEADER_USERNAME = "BasedPing_bot";
+dotenv.config();
 
-if (!BOT_TOKEN || !APP_SECRET) {
-  console.error("Missing BOT_TOKEN or APP_SECRET");
-  throw new Error("BOT_TOKEN and APP_SECRET must be set in Vercel Env");
-}
-
-const bot = new Telegraf(BOT_TOKEN);
+const prisma = new PrismaClient();
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
 
-// Middleware
-app.use(express.json());
-app.use(cors({ origin: "*" }));
-
-// Rate limiting
-const rateLimits = {};
-function rateLimit(req, res, next) {
-  const userId = req.query.userId || req.body.userId;
-  if (!userId) {
-    return res.status(400).json({ error: "userId required" });
-  }
-
-  const now = Date.now();
-  const window = 60_000;
-
-  if (!rateLimits[userId]) {
-    rateLimits[userId] = { count: 0, reset: now + window };
-  }
-
-  if (now > rateLimits[userId].reset) {
-    rateLimits[userId] = { count: 0, reset: now + window };
-  }
-
-  if (rateLimits[userId].count >= 10) {
-    return res
-      .status(429)
-      .json({ error: "Rate limit exceeded. Try again later." });
-  }
-
-  rateLimits[userId].count++;
-  next();
+if (!process.env.FRONTEND_URL) {
+  console.error("Error: FRONTEND_URL environment variable is not set.");
+  process.exit(1);
 }
 
-// Health check endpoint
+if (!process.env.APP_SECRET) {
+  console.error("Error: APP_SECRET environment variable is not set.");
+  process.exit(1);
+}
+
+app.use(express.json());
+app.use(cors({ origin: process.env.FRONTEND_URL }));
+
+const limiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 10, // Stricter limit for sensitive endpoints
+  message: { ok: false, error: "Too many requests, please try again later." },
+});
+app.use(limiter);
+
+const APP_SECRET = process.env.APP_SECRET;
+const clients = new Map();
+
+// WebSocket Connection
+wss.on("connection", async (ws, req) => {
+  const urlParams = new URLSearchParams(req.url.split("?")[1]);
+  const userId = urlParams.get("userId");
+  const token = urlParams.get("token");
+
+  if (!userId || !token || !validateWebSocketToken(userId, token)) {
+    ws.close(4000, "Invalid userId or token");
+    return;
+  }
+
+  clients.set(userId, ws);
+  console.log(`WebSocket connected for userId: ${userId}`);
+
+  ws.on("close", () => {
+    clients.delete(userId);
+    console.log(`WebSocket disconnected for userId: ${userId}`);
+  });
+
+  ws.on("error", (err) => {
+    console.error(`WebSocket error for userId ${userId}:`, err);
+    clients.delete(userId);
+  });
+});
+
+// Register Leader
+app.post("/api/register-leader", async (req, res) => {
+  const { userId, botToken, chatId, referralCode } = req.body;
+  if (!userId || !botToken || !chatId || !referralCode) {
+    return res.status(400).json({ ok: false, error: "Missing fields" });
+  }
+
+  try {
+    const leader = await prisma.leaders.upsert({
+      where: { user_id: userId },
+      update: {
+        bot_token: botToken,
+        chat_id: chatId,
+        referral_code: referralCode,
+      },
+      create: {
+        user_id: userId,
+        bot_token: botToken,
+        chat_id: chatId,
+        referral_code: referralCode,
+      },
+    });
+    res.json({ ok: true, data: { referralCode: leader.referral_code } });
+  } catch (err) {
+    if (err.code === "P2002") {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Referral code or user ID already in use" });
+    }
+    console.error("Register error:", err);
+    res.status(500).json({ ok: false, error: "Failed to register leader" });
+  }
+});
+
+// Share Trade
+app.post("/api/share-trade", async (req, res) => {
+  const { userId, trade } = req.body;
+  if (!userId || !trade?.symbol || !trade.type) {
+    return res.status(400).json({ ok: false, error: "Invalid trade" });
+  }
+
+  try {
+    const leader = await prisma.leaders.findUnique({
+      where: { user_id: userId },
+    });
+    if (!leader)
+      return res.status(404).json({ ok: false, error: "Leader not found" });
+
+    const signal = {
+      ...trade,
+      id: crypto.randomUUID(),
+      signature: generateSignature(trade),
+    };
+    const message = formatTelegramMessage(signal, userId, leader.referral_code);
+
+    // Send to Telegram with exponential backoff
+    const maxRetries = 3;
+    let attempt = 0;
+    let success = false;
+    let tgData;
+
+    while (attempt < maxRetries && !success) {
+      const tgRes = await fetch(
+        `https://api.telegram.org/bot${leader.bot_token}/sendMessage`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: leader.chat_id,
+            text: message,
+            parse_mode: "HTML",
+          }),
+        }
+      );
+
+      if (tgRes.status === 429) {
+        const retryAfter =
+          parseInt(tgRes.headers.get("Retry-After") || "1", 10) * 1000;
+        await new Promise((resolve) =>
+          setTimeout(resolve, retryAfter * Math.pow(2, attempt))
+        );
+        attempt++;
+        continue;
+      }
+
+      if (!tgRes.ok) {
+        throw new Error(`HTTP ${tgRes.status}: ${await tgRes.text()}`);
+      }
+
+      tgData = await tgRes.json();
+      if (!tgData.ok)
+        throw new Error(tgData.description || "Telegram API error");
+      success = true;
+    }
+
+    if (!success) {
+      throw new Error("Failed to send to Telegram after retries");
+    }
+
+    // Store signal
+    await prisma.signals.create({
+      data: { leader_user_id: userId, signal },
+    });
+
+    // Notify followers
+    const followers = await prisma.followers.findMany({
+      where: { leader_user_id: userId },
+      select: { follower_user_id: true },
+    });
+
+    for (const follower of followers) {
+      const ws = clients.get(follower.follower_user_id);
+      if (ws && ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify([signal]));
+      }
+    }
+
+    res.json({ ok: true, data: { signalId: signal.id } });
+  } catch (err) {
+    console.error("Share error:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Get Signals
+app.get("/api/signals", async (req, res) => {
+  const { followerUserId, page = 1, limit = 10 } = req.query;
+  if (!followerUserId) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "followerUserId required" });
+  }
+
+  try {
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const signals = await prisma.signals.findMany({
+      where: {
+        leader_user_id: {
+          in: (
+            await prisma.followers.findMany({
+              where: { follower_user_id: followerUserId },
+            })
+          ).map((r) => r.leader_user_id),
+        },
+      },
+      orderBy: { created_at: "desc" },
+      skip,
+      take: parseInt(limit),
+      select: { id: true, signal: true },
+    });
+    res.json({
+      ok: true,
+      data: signals.map((s) => ({ ...s.signal, id: s.id })),
+    });
+  } catch (err) {
+    console.error("Fetch signals error:", err);
+    res.status(500).json({ ok: false, error: "Failed to fetch signals" });
+  }
+});
+
+// Optimized Signals Query (same logic as /api/signals due to schema)
+app.get("/api/signals/optimized", async (req, res) => {
+  const { followerUserId, page = 1, limit = 10 } = req.query;
+  if (!followerUserId) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "followerUserId required" });
+  }
+
+  try {
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const signals = await prisma.signals.findMany({
+      where: {
+        leader_user_id: {
+          in: (
+            await prisma.followers.findMany({
+              where: { follower_user_id: followerUserId },
+            })
+          ).map((r) => r.leader_user_id),
+        },
+      },
+      orderBy: { created_at: "desc" },
+      skip,
+      take: parseInt(limit),
+      select: { id: true, signal: true },
+    });
+    res.json({
+      ok: true,
+      data: signals.map((s) => ({ ...s.signal, id: s.id })),
+    });
+  } catch (err) {
+    console.error("Fetch optimized signals error:", err);
+    res.status(500).json({ ok: false, error: "Failed to fetch signals" });
+  }
+});
+
+// Delete Signal
+app.delete("/api/signals/:id", async (req, res) => {
+  const { id } = req.params;
+  const { userId } = req.query;
+  if (!userId) {
+    return res.status(400).json({ ok: false, error: "userId required" });
+  }
+
+  try {
+    const signal = await prisma.signals.findUnique({ where: { id } });
+    if (
+      !signal ||
+      !(await prisma.followers.findFirst({
+        where: {
+          follower_user_id: userId,
+          leader_user_id: signal.leader_user_id,
+        },
+      }))
+    ) {
+      return res
+        .status(403)
+        .json({ ok: false, error: "Unauthorized to delete this signal" });
+    }
+    await prisma.signals.delete({ where: { id } });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Delete signal error:", err);
+    res.status(500).json({ ok: false, error: "Failed to delete signal" });
+  }
+});
+
+// Subscribe
+app.post("/api/subscribe", async (req, res) => {
+  const { leaderReferral, followerUserId, risk = 0.5 } = req.body;
+  if (!leaderReferral || !followerUserId || risk < 0.1 || risk > 2) {
+    return res.status(400).json({ ok: false, error: "Invalid request" });
+  }
+
+  try {
+    const leader = await prisma.leaders.findUnique({
+      where: { referral_code: leaderReferral },
+    });
+    if (!leader)
+      return res.status(404).json({ ok: false, error: "Leader not found" });
+
+    await prisma.followers.upsert({
+      where: {
+        leader_user_id_follower_user_id: {
+          leader_user_id: leader.user_id,
+          follower_user_id: followerUserId,
+        },
+      },
+      update: { risk },
+      create: {
+        leader_user_id: leader.user_id,
+        follower_user_id: followerUserId,
+        risk,
+      },
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.code === "P2002") {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Already subscribed to this leader" });
+    }
+    console.error("Subscribe error:", err);
+    res.status(500).json({ ok: false, error: "Failed to subscribe" });
+  }
+});
+
+// Check Subscription
+app.get("/api/subscription", async (req, res) => {
+  const { userId } = req.query;
+  if (!userId) {
+    return res.status(400).json({ ok: false, error: "userId required" });
+  }
+
+  try {
+    const subscription = await prisma.followers.findFirst({
+      where: { follower_user_id: userId },
+    });
+    if (subscription) {
+      res.json({
+        ok: true,
+        data: { subscribed: true, risk: subscription.risk },
+      });
+    } else {
+      res.json({ ok: true, data: { subscribed: false } });
+    }
+  } catch (err) {
+    console.error("Check subscription error:", err);
+    res.status(500).json({ ok: false, error: "Failed to check subscription" });
+  }
+});
+
+// Get Risk
+app.get("/api/risk", async (req, res) => {
+  const { userId, leaderReferral } = req.query;
+  if (!userId || !leaderReferral) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "userId and leaderReferral required" });
+  }
+
+  try {
+    const leader = await prisma.leaders.findUnique({
+      where: { referral_code: leaderReferral },
+    });
+    if (!leader)
+      return res.status(404).json({ ok: false, error: "Leader not found" });
+    const follower = await prisma.followers.findFirst({
+      where: { leader_user_id: leader.user_id, follower_user_id: userId },
+    });
+    if (!follower)
+      return res
+        .status(404)
+        .json({ ok: false, error: "Subscription not found" });
+    res.json({ ok: true, data: { risk: follower.risk } });
+  } catch (err) {
+    console.error("Fetch risk error:", err);
+    res.status(500).json({ ok: false, error: "Failed to fetch risk" });
+  }
+});
+
+// Update Risk
+app.post("/api/risk", async (req, res) => {
+  const { leaderReferral, followerUserId, risk } = req.body;
+  if (!leaderReferral || !followerUserId || risk < 0.1 || risk > 2) {
+    return res.status(400).json({ ok: false, error: "Invalid request" });
+  }
+
+  try {
+    const leader = await prisma.leaders.findUnique({
+      where: { referral_code: leaderReferral },
+    });
+    if (!leader)
+      return res.status(404).json({ ok: false, error: "Leader not found" });
+
+    await prisma.followers.updateMany({
+      where: {
+        leader_user_id: leader.user_id,
+        follower_user_id: followerUserId,
+      },
+      data: { risk },
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Update risk error:", err);
+    res.status(500).json({ ok: false, error: "Failed to update risk" });
+  }
+});
+
+// Webhook (Basic Implementation)
+app.post("/webhook", async (req, res) => {
+  console.log("Webhook received:", req.body);
+  // Customize based on your needs (e.g., Telegram bot updates)
+  res.json({ ok: true });
+});
+
+// Test Telegram
+app.post("/api/test-telegram", async (req, res) => {
+  const { botToken, chatId, message } = req.body;
+  if (!botToken || !chatId || !message) {
+    return res.status(400).json({ ok: false, error: "Missing fields" });
+  }
+
+  try {
+    const tgRes = await fetch(
+      `https://api.telegram.org/bot${botToken}/sendMessage`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: message,
+          parse_mode: "HTML",
+        }),
+      }
+    );
+    const tgData = await tgRes.json();
+    if (!tgData.ok) throw new Error(tgData.description || "Telegram API error");
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Test telegram error:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Root Endpoint (API Status)
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
@@ -64,369 +462,50 @@ app.get("/", (req, res) => {
   });
 });
 
-app.get("/api", (req, res) => {
-  res.json({
-    status: "ok",
-    message: "API endpoint working",
+function generateSignature(trade) {
+  const data = JSON.stringify({
+    symbol: trade.symbol,
+    side: trade.side,
+    size: trade.size,
+    price: trade.price,
+    leverage: trade.leverage,
   });
-});
-
-// === BOT COMMANDS ===
-bot.command("subscribe", async (ctx) => {
-  try {
-    const ref = ctx.message.text.match(/ref=([A-Z]+)/)?.[1];
-    if (ref !== "GODSEYE") {
-      return ctx.reply(
-        "Invalid referral code. Please use: /subscribe ref=GODSEYE"
-      );
-    }
-
-    const userId = ctx.from.id.toString();
-
-    await sql`
-      INSERT INTO subs (user_id, risk, ref) 
-      VALUES (${userId}, 0.5, ${ref})
-      ON CONFLICT (user_id) 
-      DO UPDATE SET risk = 0.5, ref = ${ref}
-    `;
-
-    ctx.reply(
-      `✅ Successfully subscribed!\n\n` +
-        `Your default risk multiplier is 0.5x\n` +
-        `Use /risk <value> to adjust (0.1 to 2.0)\n\n` +
-        `Example: /risk 1.0`
-    );
-  } catch (e) {
-    console.error("Subscribe error:", e);
-    ctx.reply("❌ Error subscribing. Please try again.");
-  }
-});
-
-bot.command("unsubscribe", async (ctx) => {
-  try {
-    const userId = ctx.from.id.toString();
-
-    await sql`DELETE FROM signals WHERE user_id = ${userId}`;
-    const { rowCount } = await sql`DELETE FROM subs WHERE user_id = ${userId}`;
-
-    ctx.reply(
-      rowCount > 0
-        ? "✅ Successfully unsubscribed. All your signals have been deleted."
-        : "❌ You are not subscribed."
-    );
-  } catch (e) {
-    console.error("Unsubscribe error:", e);
-    ctx.reply("❌ Error unsubscribing. Please try again.");
-  }
-});
-
-bot.command("risk", async (ctx) => {
-  try {
-    const userId = ctx.from.id.toString();
-    const riskText = ctx.message.text.split(" ")[1];
-
-    if (!riskText) {
-      return ctx.reply(
-        "Please specify a risk value.\n\n" +
-          "Usage: /risk <value>\n" +
-          "Example: /risk 1.0\n\n" +
-          "Valid range: 0.1 to 2.0"
-      );
-    }
-
-    const risk = parseFloat(riskText);
-
-    if (isNaN(risk) || risk < 0.1 || risk > 2) {
-      return ctx.reply(
-        "❌ Invalid risk value.\n\n" +
-          "Risk must be between 0.1 and 2.0\n" +
-          "Examples:\n" +
-          "• /risk 0.5 (conservative)\n" +
-          "• /risk 1.0 (standard)\n" +
-          "• /risk 2.0 (aggressive)"
-      );
-    }
-
-    const { rowCount } = await sql`
-      UPDATE subs 
-      SET risk = ${risk} 
-      WHERE user_id = ${userId}
-    `;
-
-    ctx.reply(
-      rowCount > 0
-        ? `✅ Risk multiplier updated to ${risk}x`
-        : "❌ Please subscribe first using: /subscribe ref=GODSEYE"
-    );
-  } catch (e) {
-    console.error("Risk update error:", e);
-    ctx.reply("❌ Error updating risk. Please try again.");
-  }
-});
-
-bot.command("status", async (ctx) => {
-  try {
-    const userId = ctx.from.id.toString();
-    const { rows } = await sql`
-      SELECT risk, ref, created_at 
-      FROM subs 
-      WHERE user_id = ${userId}
-    `;
-
-    if (rows.length === 0) {
-      return ctx.reply(
-        "❌ You are not subscribed.\n\n" +
-          "To subscribe, use: /subscribe ref=GODSEYE"
-      );
-    }
-
-    const { risk, ref, created_at } = rows[0];
-    const signalCount = await sql`
-      SELECT COUNT(*) as count 
-      FROM signals 
-      WHERE user_id = ${userId}
-    `;
-
-    ctx.reply(
-      `📊 Your Status:\n\n` +
-        `✅ Subscribed: Yes\n` +
-        `🎯 Risk Multiplier: ${risk}x\n` +
-        `🔑 Referral: ${ref}\n` +
-        `📈 Active Signals: ${signalCount.rows[0].count}\n` +
-        `📅 Subscribed Since: ${new Date(created_at).toLocaleDateString()}`
-    );
-  } catch (e) {
-    console.error("Status error:", e);
-    ctx.reply("❌ Error fetching status. Please try again.");
-  }
-});
-
-bot.command("help", (ctx) => {
-  ctx.reply(
-    `🤖 Trade Copier Bot Commands:\n\n` +
-      `/subscribe ref=GODSEYE - Subscribe to signals\n` +
-      `/unsubscribe - Unsubscribe from signals\n` +
-      `/risk <value> - Set risk multiplier (0.1-2.0)\n` +
-      `/status - Check your subscription status\n` +
-      `/help - Show this help message\n\n` +
-      `For support, contact the admin.`
-  );
-});
-
-// === SIGNAL INTAKE ===
-bot.on("text", async (ctx) => {
-  try {
-    // Only process messages from the leader bot containing trade alerts
-    if (
-      !ctx.message.text.includes("New Trade Alert!") ||
-      ctx.from.username !== LEADER_USERNAME
-    ) {
-      return;
-    }
-
-    console.log("Received signal from leader bot");
-
-    // Extract signal JSON from message
-    const match = ctx.message.text.match(
-      /SIGNAL: ({[\s\S]*?})(?:<\/tg-spoiler>|$)/
-    );
-
-    if (!match) {
-      console.log("No signal pattern found in message");
-      return;
-    }
-
-    let signal;
-    try {
-      signal = JSON.parse(match[1]);
-    } catch (parseError) {
-      console.error("Failed to parse signal JSON:", parseError);
-      return;
-    }
-
-    // Verify signal signature
-    if (!verifySignal(signal)) {
-      console.log("Invalid signal signature");
-      return;
-    }
-
-    const signalId = crypto.randomUUID();
-
-    // Get all subscribed users
-    const { rows } = await sql`
-      SELECT user_id, risk 
-      FROM subs 
-      WHERE ref = 'GODSEYE'
-    `;
-
-    console.log(`Broadcasting to ${rows.length} subscribers`);
-
-    // Insert signal for each subscriber
-    for (const { user_id, risk } of rows) {
-      try {
-        const adjustedSignal = {
-          ...signal,
-          id: signalId,
-          originalSize: signal.size,
-          adjustedSize: signal.size * risk,
-          userRisk: risk,
-        };
-
-        await sql`
-          INSERT INTO signals (id, user_id, signal) 
-          VALUES (${signalId}, ${user_id}, ${JSON.stringify(
-          adjustedSignal
-        )}::jsonb)
-          ON CONFLICT (id, user_id) DO NOTHING
-        `;
-      } catch (insertError) {
-        console.error(
-          `Error inserting signal for user ${user_id}:`,
-          insertError
-        );
-      }
-    }
-
-    console.log(`Signal ${signalId} broadcast complete`);
-  } catch (e) {
-    console.error("Signal processing error:", e);
-  }
-});
-
-function verifySignal(signal) {
-  try {
-    const data = JSON.stringify({
-      symbol: signal.symbol,
-      side: signal.side,
-      size: signal.size,
-      price: signal.price,
-      leverage: signal.leverage,
-    });
-
-    const hash = crypto
-      .createHmac("sha256", APP_SECRET)
-      .update(data)
-      .digest("hex");
-
-    return hash === signal.signature;
-  } catch (e) {
-    console.error("Signature verification error:", e);
-    return false;
-  }
+  return crypto.createHmac("sha256", APP_SECRET).update(data).digest("hex");
 }
 
-// === API ROUTES ===
-app.get("/api/signals", rateLimit, async (req, res) => {
-  try {
-    const { userId } = req.query;
+function validateWebSocketToken(userId, token) {
+  const expected = `${userId}:${Math.floor(
+    Date.now() / (1000 * 60)
+  )}:${APP_SECRET}`; // Token valid for 1 minute
+  const hash = crypto
+    .createHmac("sha256", APP_SECRET)
+    .update(expected)
+    .digest("hex");
+  return token === hash;
+}
 
-    const { rows } = await sql`
-      SELECT signal 
-      FROM signals 
-      WHERE user_id = ${userId} 
-      ORDER BY created_at DESC 
-      LIMIT 10
-    `;
+function formatTelegramMessage(signal, leaderUserId, referralCode) {
+  const sideEmoji = signal.side.toUpperCase() === "BUY" ? "🟢 BUY" : "🔴 SELL";
+  const typeTitle =
+    signal.type === "Closed" ? "*Position Closed!*" : "*New Trade Alert!*";
+  return `
+${typeTitle}
 
-    res.json({
-      success: true,
-      count: rows.length,
-      signals: rows.map((r) => r.signal),
-    });
-  } catch (e) {
-    console.error("Get signals error:", e);
-    res.status(500).json({
-      error: "Failed to fetch signals",
-      details: e.message,
-    });
-  }
+📊 **Symbol:** \`${signal.symbol}\`
+📈 **Side:** ${sideEmoji}
+💰 **Size:** ${signal.size}
+💵 **Price:** $${signal.price}
+⚡ **Leverage:** ${signal.leverage}x
+🕒 **Time:** ${new Date().toLocaleString()}
+
+🔗 **Join my signals:** https://based-one-trade-sharer.vercel.app//?ref=${referralCode}
+
+<tg-spoiler>SIGNAL: ${JSON.stringify(signal)}</tg-spoiler>
+  `;
+}
+
+server.listen(process.env.PORT || 3000, () => {
+  console.log(`Server running on port ${process.env.PORT || 3000}`);
 });
 
-app.delete("/api/signals/:id", rateLimit, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { userId } = req.query;
-
-    const { rowCount } = await sql`
-      DELETE FROM signals 
-      WHERE id = ${id} AND user_id = ${userId}
-    `;
-
-    res.json(
-      rowCount > 0
-        ? { success: true, message: "Signal deleted" }
-        : { success: false, error: "Signal not found" }
-    );
-  } catch (e) {
-    console.error("Delete signal error:", e);
-    res.status(500).json({
-      error: "Failed to delete signal",
-      details: e.message,
-    });
-  }
-});
-
-app.get("/api/risk", rateLimit, async (req, res) => {
-  try {
-    const { userId } = req.query;
-
-    const { rows } = await sql`
-      SELECT risk 
-      FROM subs 
-      WHERE user_id = ${userId}
-    `;
-
-    res.json(
-      rows[0]
-        ? { success: true, risk: rows[0].risk }
-        : { success: false, error: "Not subscribed" }
-    );
-  } catch (e) {
-    console.error("Get risk error:", e);
-    res.status(500).json({
-      error: "Failed to fetch risk",
-      details: e.message,
-    });
-  }
-});
-
-app.get("/api/subscription", rateLimit, async (req, res) => {
-  try {
-    const { userId } = req.query;
-
-    const { rows } = await sql`
-      SELECT risk, ref, created_at 
-      FROM subs 
-      WHERE user_id = ${userId}
-    `;
-
-    res.json({
-      success: true,
-      subscribed: rows.length > 0,
-      risk: rows[0]?.risk || null,
-      ref: rows[0]?.ref || null,
-      subscribedSince: rows[0]?.created_at || null,
-    });
-  } catch (e) {
-    console.error("Get subscription error:", e);
-    res.status(500).json({
-      error: "Failed to fetch subscription",
-      details: e.message,
-    });
-  }
-});
-
-// Webhook endpoint for Telegram
-app.use("/webhook", bot.webhookCallback("/webhook"));
-
-// Handle 404
-app.use((req, res) => {
-  res.status(404).json({
-    error: "Not found",
-    path: req.path,
-    message: "The requested endpoint does not exist",
-  });
-});
-
-// Export for Vercel serverless function
 export default app;

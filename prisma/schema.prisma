@@ -13,3 +13,44 @@ datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
+
+// Models (your tables as type-safe schemas)
+model leaders {
+  id            String   @id @default(uuid())
+  user_id       String   @unique  // Telegram user ID
+  bot_token     String
+  chat_id       String
+  referral_code String   @unique  // Auto-generated
+  created_at    DateTime @default(now())
+
+  // Relations
+  followers     followers[]
+  signals       signals[]
+
+  @@map("leaders")  // Maps to "leaders" table
+}
+
+model followers {
+  id              String   @id @default(uuid())
+  leader_user_id  String
+  follower_user_id String
+  risk            Float    @default(0.5)
+
+  // Relations
+  leader          leaders  @relation(fields: [leader_user_id], references: [user_id], onDelete: Cascade)
+  
+  @@unique([leader_user_id, follower_user_id])  // One follower per leader
+  @@map("followers")
+}
+
+model signals {
+  id             String   @id @default(uuid())
+  leader_user_id String
+  signal         Json     // JSONB for trade data
+  created_at     DateTime @default(now())
+
+  // Relations
+  leader         leaders  @relation(fields: [leader_user_id], references: [user_id])
+
+  @@map("signals")
+}
