@@ -1,12 +1,10 @@
 {
   "version": 2,
+  "buildCommand": "prisma generate",
   "builds": [
     {
       "src": "api/index.js",
       "use": "@vercel/node"
-    },
-    {
-      "buildCommand": "prisma generate"
     }
   ],
   "routes": [
@@ -17,10 +15,9 @@
     {
       "src": "/api/(.*)",
       "dest": "/api/index.js"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "/api/index.js"
     }
-  ]
+  ],
+  "env": {
+    "DATABASE_URL": "@database_url"
+  }
 }
