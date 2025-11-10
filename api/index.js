@@ -1,15 +1,19 @@
-// api/index.js - Vercel Compatible Version
+// index.js
 import { PrismaClient } from "@prisma/client";
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
 import * as dotenv from "dotenv";
 import rateLimit from "express-rate-limit";
+import { WebSocketServer } from "ws";
+import http from "http";
 
 dotenv.config();
 
 const prisma = new PrismaClient();
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
 
 if (!process.env.FRONTEND_URL) {
   console.error("Error: FRONTEND_URL environment variable is not set.");
@@ -25,13 +29,39 @@ app.use(express.json());
 app.use(cors({ origin: process.env.FRONTEND_URL }));
 
 const limiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 10,
+  windowMs: 60 * 1000, // 1 minute
+  max: 10, // Stricter limit for sensitive endpoints
   message: { ok: false, error: "Too many requests, please try again later." },
 });
 app.use(limiter);
 
 const APP_SECRET = process.env.APP_SECRET;
+const clients = new Map();
+
+// WebSocket Connection
+wss.on("connection", async (ws, req) => {
+  const urlParams = new URLSearchParams(req.url.split("?")[1]);
+  const userId = urlParams.get("userId");
+  const token = urlParams.get("token");
+
+  if (!userId || !token || !validateWebSocketToken(userId, token)) {
+    ws.close(4000, "Invalid userId or token");
+    return;
+  }
+
+  clients.set(userId, ws);
+  console.log(`WebSocket connected for userId: ${userId}`);
+
+  ws.on("close", () => {
+    clients.delete(userId);
+    console.log(`WebSocket disconnected for userId: ${userId}`);
+  });
+
+  ws.on("error", (err) => {
+    console.error(`WebSocket error for userId ${userId}:`, err);
+    clients.delete(userId);
+  });
+});
 
 // Register Leader
 app.post("/api/register-leader", async (req, res) => {
@@ -137,6 +167,19 @@ app.post("/api/share-trade", async (req, res) => {
       data: { leader_user_id: userId, signal },
     });
 
+    // Notify followers
+    const followers = await prisma.followers.findMany({
+      where: { leader_user_id: userId },
+      select: { follower_user_id: true },
+    });
+
+    for (const follower of followers) {
+      const ws = clients.get(follower.follower_user_id);
+      if (ws && ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify([signal]));
+      }
+    }
+
     res.json({ ok: true, data: { signalId: signal.id } });
   } catch (err) {
     console.error("Share error:", err);
@@ -180,7 +223,7 @@ app.get("/api/signals", async (req, res) => {
   }
 });
 
-// Optimized Signals Query
+// Optimized Signals Query (same logic as /api/signals due to schema)
 app.get("/api/signals/optimized", async (req, res) => {
   const { followerUserId, page = 1, limit = 10 } = req.query;
   if (!followerUserId) {
@@ -369,9 +412,10 @@ app.post("/api/risk", async (req, res) => {
   }
 });
 
-// Webhook
+// Webhook (Basic Implementation)
 app.post("/webhook", async (req, res) => {
   console.log("Webhook received:", req.body);
+  // Customize based on your needs (e.g., Telegram bot updates)
   res.json({ ok: true });
 });
 
@@ -404,7 +448,7 @@ app.post("/api/test-telegram", async (req, res) => {
   }
 });
 
-// Root Endpoint
+// Root Endpoint (API Status)
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
@@ -429,6 +473,17 @@ function generateSignature(trade) {
   return crypto.createHmac("sha256", APP_SECRET).update(data).digest("hex");
 }
 
+function validateWebSocketToken(userId, token) {
+  const expected = `${userId}:${Math.floor(
+    Date.now() / (1000 * 60)
+  )}:${APP_SECRET}`; // Token valid for 1 minute
+  const hash = crypto
+    .createHmac("sha256", APP_SECRET)
+    .update(expected)
+    .digest("hex");
+  return token === hash;
+}
+
 function formatTelegramMessage(signal, leaderUserId, referralCode) {
   const sideEmoji = signal.side.toUpperCase() === "BUY" ? "🟢 BUY" : "🔴 SELL";
   const typeTitle =
@@ -441,7 +496,7 @@ ${typeTitle}
 💰 **Size:** ${signal.size}
 💵 **Price:** $${signal.price}
 ⚡ **Leverage:** ${signal.leverage}x
-🕐 **Time:** ${new Date().toLocaleString()}
+🕒 **Time:** ${new Date().toLocaleString()}
 
 🔗 **Join my signals:** https://based-one-trade-sharer.vercel.app//?ref=${referralCode}
 
@@ -449,5 +504,8 @@ ${typeTitle}
   `;
 }
 
-// Export for Vercel serverless
+server.listen(process.env.PORT || 3000, () => {
+  console.log(`Server running on port ${process.env.PORT || 3000}`);
+});
+
 export default app;

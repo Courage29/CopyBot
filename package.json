@@ -7,8 +7,10 @@
     "start": "node api/index.js",
     "dev": "node api/index.js",
     "prisma:generate": "prisma generate",
-    "db:push": "prisma db push",
+    "build": "prisma generate",
+    "vercel-build": "prisma generate",
     "postinstall": "prisma generate",
+    "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
     "db:generate": "prisma generate"
   },

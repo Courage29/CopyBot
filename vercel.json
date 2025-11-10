@@ -4,6 +4,9 @@
     {
       "src": "api/index.js",
       "use": "@vercel/node"
+    },
+    {
+      "buildCommand": "prisma generate"
     }
   ],
   "routes": [
